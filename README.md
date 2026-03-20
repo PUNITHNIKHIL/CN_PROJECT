@@ -1,145 +1,91 @@
-# Project 8 — Reliable File Transfer Protocol (Custom FTP)
-**CS558 / CS601 / CS918 | CN Mini Project | Deliverable 1**
+# Reliable File Transfer (Custom Hybrid Protocol)
 
----
+`CS558 / CS601 / CS918 | CN Mini Project`
 
-## Architecture
+Hybrid design:
+- Control: `TLS-over-TCP` (`localhost:9000`)
+- Data: `UDP` chunks
+- No external dependencies (Python stdlib only)
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                      HYBRID DESIGN                        │
-│                                                           │
-│  TCP + SSL/TLS  ──►  Control Channel                      │
-│                      (session setup, metadata, ACK/NACK)  │
-│                                                           │
-│  UDP            ──►  Data Channel                         │
-│                      (raw file chunks, high throughput)   │
-└──────────────────────────────────────────────────────────┘
+## 📁 Files
 
-CLIENT                             SERVER
-  │                                   │
-  │── SSL Handshake (TCP:9000) ──────►│
-  │◄─ Handshake Complete ─────────────│
-  │                                   │
-  │── UPLOAD_REQ <name> <size> <sha>─►│
-  │◄─ UPLOAD_ACK <udp_port> <chunk> ──│
-  │                                   │  (server opens UDP socket)
-  │══ UDP chunks (seq, total, data) ══►│
-  │◄─ CHUNK_ACK <seq>  (SSL/TCP) ─────│
-  │══ retransmit NACKed chunks ════════►│
-  │                                   │
-  │◄─ TRANSFER_OK <sha256> ───────────│
-```
+- server.py: TLS control server, per-client `Thread`, per-session UDP port
+- client.py: `upload()` + `download()` client routines
+- protocol.py: constants + `split/reassemble` + `pack/unpack` + framed messages
+- test_multi_client.py: 3 concurrent upload clients for validation
+- server.crt, server.key: self-signed TLS cert/key
+- received: server-side received files
+- `downloads/`: client-side downloaded files
 
----
+## ⚙️ Setup
 
-## Files
+1. (Optional) Make certs if missing:
+   ```bash
+   openssl req -x509 -newkey rsa:2048 \
+     -keyout certs/server.key -out certs/server.crt \
+     -days 365 -nodes -subj "/CN=localhost"
+   ```
+2. Python 3.9+
+3. Run server:
+   ```bash
+   python server.py
+   ```
 
-| File | Description |
-|---|---|
-| `server.py` | Multi-threaded server — SSL/TCP control + per-session UDP |
-| `client.py` | Client — upload/download with SSL + UDP chunks |
-| `protocol.py` | Shared: chunk packing, SHA-256, message framing |
-| `test_multi_client.py` | Spawns 3 concurrent clients for Deliverable 1 demo |
-| `certs/server.crt` | Self-signed TLS certificate |
-| `certs/server.key` | TLS private key |
+## ▶️ Upload
 
----
+1. Client init TLS connection → `UPLOAD_REQ <name> <filesize>`
+2. Server opens UDP socket, replies `UPLOAD_ACK <udp_port>`
+3. Client sends all chunks over UDP:
+   - each chunk = `seq,total,len,data`
+4. Server replies per-chunk `ACK <seq>` on TLS channel
+5. Client loops pending until all ACKed
+6. Server writes `received/<name>` and sends `UPLOAD_COMPLETE`
 
-## Setup
-
-### 1. Generate Certificates (already done — skip if certs exist)
+Usage:
 ```bash
-openssl req -x509 -newkey rsa:2048 \
-    -keyout certs/server.key -out certs/server.crt \
-    -days 365 -nodes -subj "/CN=localhost"
+python client.py upload 127.0.0.1 /path/to/file.bin
 ```
 
-### 2. Install dependencies
+## ▶️ Download
+
+1. Client TLS `DOWNLOAD_REQ <name>`
+2. Server responds:
+   - `FILE_NOT_FOUND` or
+   - `DOWNLOAD_READY <total>`
+3. Client binds a local UDP port, sends `PORT <port>`
+4. Server UDP sends all chunks to client
+5. Client reassembles and writes `downloads/<name>`
+6. Server sends `DOWNLOAD_COMPLETE`
+
+Usage:
 ```bash
-# No third-party packages required — uses Python stdlib only
-python3 --version   # needs 3.9+
+python client.py download 127.0.0.1 file.bin
 ```
 
-### 3. Run the server
+## 🧠 Protocol (actual in code)
+
+- `CONTROL_PORT=9000`
+- `CHUNK_SIZE=4096`
+- UDP payload: 12-byte header + data:
+  - `(seq, total, len)` as `!III`
+- TLS control message ends with `\n` (send_msg/recv_msg)
+
+## 🧪 Demo: concurrent clients
+
 ```bash
-python3 server.py
-# Listens on TCP:9000 (SSL control) + dynamic UDP ports per session
+python test_multi_client.py
 ```
+- Creates:
+  - `small_1KB.bin`
+  - `medium_64KB.bin`
+  - `large_256KB.bin`
+- Launches 3 threads:
+  - each calls `upload("127.0.0.1", file)`
+- Reports success/failure + timing
 
-### 4. Upload a file (single client)
-```bash
-python3 client.py upload 127.0.0.1 /path/to/myfile.txt
-```
+## ⚠️ Behavior notes
 
-### 5. Download a file
-```bash
-python3 client.py download 127.0.0.1 myfile.txt
-```
-
-### 6. Multi-client demo (Deliverable 1)
-```bash
-# Terminal 1
-python3 server.py
-
-# Terminal 2
-python3 test_multi_client.py
-```
-
----
-
-## Protocol Design
-
-### Control Messages (SSL/TCP — newline delimited)
-
-| Message | Direction | Meaning |
-|---|---|---|
-| `UPLOAD_REQ <name> <size> <sha256>` | C→S | Start upload |
-| `UPLOAD_ACK <udp_port> <chunk_size>` | S→C | Ready, use this UDP port |
-| `CHUNK_ACK <seq>` | S→C | Chunk received OK |
-| `CHUNK_NACK <seq>` | S→C | Retransmit this chunk |
-| `TRANSFER_OK <sha256>` | S→C | File complete and verified |
-| `TRANSFER_ERR <reason>` | S→C | Failure |
-| `DOWNLOAD_REQ <filename>` | C→S | Request download |
-| `DOWNLOAD_META <size> <sha> <chunks>` | S→C | File metadata |
-| `DOWNLOAD_READY <udp_port>` | C→S | Ready to receive on this UDP port |
-
-### UDP Chunk Format (binary, 12-byte header)
-
-```
- 0        4        8       12     12+N
- ┌────────┬────────┬────────┬──────────┐
- │seq_num │total   │data_len│  data... │
- │(4B BI) │(4B BI) │(4B BI) │          │
- └────────┴────────┴────────┴──────────┘
-```
-- **BI** = Big-endian unsigned int (`!I` in Python struct)
-- Default chunk size: **4096 bytes**
-
----
-
-## Deliverable 1 Checklist
-
-- [x] SSL/TLS handshake on control channel (TCP:9000)
-- [x] File split into chunks, sent over UDP
-- [x] Per-chunk ACK/NACK over secure SSL channel
-- [x] SHA-256 integrity verification after full transfer
-- [x] Multi-client support via threading (one thread per session)
-- [x] Graceful handling of client disconnect / UDP timeout
-- [x] `test_multi_client.py` — 3 concurrent clients demo
-
----
-
-## Key Design Decisions
-
-**Why TCP for control + UDP for data?**
-- SSL/TLS requires a reliable, ordered stream → TCP is the right fit for the control channel
-- Data chunks benefit from UDP's lower overhead and parallelism
-- This mirrors how protocols like TFTP, QUIC, and media streaming work
-
-**Why ACK over TCP instead of UDP?**
-- ACKs are tiny and order-sensitive — TCP/SSL guarantees they arrive reliably without extra implementation cost
-- Keeps the reliability logic simple: sender retransmits anything not ACKed
-
-**Chunk size = 4096 bytes**
-- Fits comfortably within common MTU after headers; easy to tune in `protocol.py`
+- No explicit retransmission timer in code (infinite retry in loop until ACKs arrive)
+- No packet loss simulation; UDP reliability is assumed on local host
+- No SHA-256 hash or CRC validation currently in `client.upload` / `server.handle_upload` in actual implementation (the code has helpers in protocol.py, but they are unused)
+- No per-chunk `NACK` in current flow, only `ACK`; pending set loop triggers resend
