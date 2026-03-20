@@ -1,5 +1,5 @@
 # Project 8 — Reliable File Transfer Protocol (Custom FTP)
-**AM368 / AM373 / AM379 | CN Mini Project | Deliverable 1**
+**CS558 / CS601 / CS918 | CN Mini Project | Deliverable 1**
 
 ---
 
