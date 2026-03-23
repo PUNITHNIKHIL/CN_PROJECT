@@ -1,83 +1,54 @@
 import struct
-import hashlib
+import zlib
 
-CHUNK_SIZE = 4096
-UDP_HEADER_SIZE = 12
-UDP_PACKET_SIZE = CHUNK_SIZE + UDP_HEADER_SIZE
+"""
+Packet Format:
+- Sequence Number (4 bytes, unsigned int)
+- Acknowledgment Number (4 bytes, unsigned int)
+- Flags (1 byte, unsigned char)
+- Checksum (4 bytes, unsigned int)
+- Payload (variable, up to 1400 bytes)
 
-CONTROL_PORT = 9000
-BUFFER_SIZE = 8192
+Total Header Size: 13 bytes
+"""
 
+MAX_PAYLOAD_SIZE = 1400
+HEADER_FORMAT = "!IIB I" # Seq (4), Ack (4), Flags (1), Checksum (4)
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
-def pack_chunk(seq, total, data):
-    header = struct.pack("!III", seq, total, len(data))
-    return header + data
+# Flags
+FLAG_SYN = 1 << 0
+FLAG_ACK = 1 << 1
+FLAG_FIN = 1 << 2
+FLAG_DATA = 1 << 3
 
+def create_packet(seq_num, ack_num, flags, payload=b""):
+    """
+    Creates a UDP packet with the given header fields and payload.
+    Calculates the CRC32 checksum over the payload.
+    """
+    checksum = zlib.crc32(payload) & 0xffffffff
+    header = struct.pack(HEADER_FORMAT, seq_num, ack_num, flags, checksum)
+    return header + payload
 
-def unpack_chunk(packet):
-    seq, total, size = struct.unpack("!III", packet[:12])
-    data = packet[12:12+size]
-    return seq, total, data
-
-
-def split_file(path):
-
-    chunks = []
-
-    with open(path, "rb") as f:
-        while True:
-            data = f.read(CHUNK_SIZE)
-
-            if not data:
-                break
-
-            chunks.append(data)
-
-    return chunks
-
-
-def reassemble(chunks, total):
-
-    data = b""
-
-    for i in range(total):
-        data += chunks[i]
-
-    return data
-
-
-def sha256_file(path):
-
-    h = hashlib.sha256()
-
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(65536)
-
-            if not b:
-                break
-
-            h.update(b)
-
-    return h.hexdigest()
-
-
-def send_msg(sock, msg):
-
-    sock.sendall((msg + "\n").encode())
-
-
-def recv_msg(sock):
-
-    data = b""
-
-    while not data.endswith(b"\n"):
-
-        part = sock.recv(BUFFER_SIZE)
-
-        if not part:
-            raise ConnectionError("Connection closed")
-
-        data += part
-
-    return data.decode().strip()
+def parse_packet(packet):
+    """
+    Parses a UDP packet into header fields and payload.
+    Verifies the CRC32 checksum. Returns None if checksum fails or packet is too small.
+    """
+    if len(packet) < HEADER_SIZE:
+        return None
+        
+    header = packet[:HEADER_SIZE]
+    payload = packet[HEADER_SIZE:]
+    
+    try:
+        seq_num, ack_num, flags, checksum = struct.unpack(HEADER_FORMAT, header)
+    except struct.error:
+        return None
+        
+    calc_checksum = zlib.crc32(payload) & 0xffffffff
+    if checksum != calc_checksum:
+        return None  # Checksum mismatch
+        
+    return seq_num, ack_num, flags, payload

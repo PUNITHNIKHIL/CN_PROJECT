@@ -1,91 +1,58 @@
-# Reliable File Transfer (Custom Hybrid Protocol)
+# Reliable P2P File Transfer Protocol
 
-`CS558 / CS601 / CS918 | CN Mini Project`
+`CS 918 | CS 601 | CS 558`
 
-Hybrid design:
-- Control: `TLS-over-TCP` (`localhost:9000`)
-- Data: `UDP` chunks
-- No external dependencies (Python stdlib only)
+---
+An interactive, peer-to-peer (P2P) file transfer application built entirely over UDP. This project implements a custom reliable data transfer protocol using **Selective Repeat ARQ**, ensuring fast, reliable, and resumable file transfers over an unreliable network layer.
 
-## 📁 Files
+## Features
 
-- server.py: TLS control server, per-client `Thread`, per-session UDP port
-- client.py: `upload()` + `download()` client routines
-- protocol.py: constants + `split/reassemble` + `pack/unpack` + framed messages
-- test_multi_client.py: 3 concurrent upload clients for validation
-- server.crt, server.key: self-signed TLS cert/key
-- received: server-side received files
-- `downloads/`: client-side downloaded files
+- **Reliability over UDP**: Custom packet headers ensure packet sequencing. Lost or delayed packets are seamlessly recovered using Selective Repeat Automatic Repeat ReQuest (ARQ).
+- **Throughput Optimization**: Implements a Sliding Window protocol, allowing multiple packets to be in-flight concurrently without waiting for individual ACKs, maximizing network bandwidth.
+- **Resumable Transfers**: If a transfer is interrupted unexpectedly (e.g., connection drop or crash), the system automatically syncs size states and resumes exactly where it left off, avoiding redundant data transmission.
+- **Integrity Checking**: Each chunk calculates a CRC32 checksum before transmission. The receiver strictly verifies this checksum and drops corrupted packets.
+- **Multiplexed Receiving**: The background daemon securely manages state per connecting client, permitting multiple different peers to send files to the node simultaneously.
+- **Peer-to-Peer CLI**: A simple, unified command-line node interface that runs a background listener while providing an active shell for sending robust files.
 
-## ⚙️ Setup
+## Project Structure
 
-1. (Optional) Make certs if missing:
+- `protocol.py`: Defines the foundational custom binary UDP packet structure, header packing/unpacking, and CRC32 checksum validation logic.
+- `receiver.py`: Contains the robust UDP daemon logic for maintaining per-client state mapping, buffering out-of-order sequence packets, and writing consecutive packets efficiently to the disk.
+- `sender.py`: Implements the sliding window client, handling SYN handshakes for resuming files, monitoring ACK timeouts, and executing selective packet retransmission.
+- `node.py`: The main interactive shell application integrating the receiver and sender seamlessly into a single runtime.
+
+## Getting Started
+
+### Prerequisites
+- Python 3.x (No external dependencies required)
+
+### Usage
+
+1. **Launch a Node**
+   Open a terminal and start your node. It will bind to port `5000` by default.
    ```bash
-   openssl req -x509 -newkey rsa:2048 \
-     -keyout certs/server.key -out certs/server.crt \
-     -days 365 -nodes -subj "/CN=localhost"
+   python node.py --port 5000
    ```
-2. Python 3.9+
-3. Run server:
+
+2. **Launch a Peer Node**
+   On a different terminal (or a different computer on the same LAN), launch another node on an available port (e.g., `5001`).
    ```bash
-   python server.py
+   python node.py --port 5001
    ```
 
-## ▶️ Upload
+3. **Transfer a File**
+   In the interactive prompt of your first node, establish a connection to your peer and execute a transfer:
+   ```text
+   > connect 127.0.0.1 5001
+   > send path/to/any/file.ext
+   ```
 
-1. Client init TLS connection → `UPLOAD_REQ <name> <filesize>`
-2. Server opens UDP socket, replies `UPLOAD_ACK <udp_port>`
-3. Client sends all chunks over UDP:
-   - each chunk = `seq,total,len,data`
-4. Server replies per-chunk `ACK <seq>` on TLS channel
-5. Client loops pending until all ACKed
-6. Server writes `received/<name>` and sends `UPLOAD_COMPLETE`
+   *The file will automatically begin downloading in the background on the peer node into a `downloads/` directory.*
 
-Usage:
-```bash
-python client.py upload 127.0.0.1 /path/to/file.bin
-```
+### Testing Resumability
 
-## ▶️ Download
-
-1. Client TLS `DOWNLOAD_REQ <name>`
-2. Server responds:
-   - `FILE_NOT_FOUND` or
-   - `DOWNLOAD_READY <total>`
-3. Client binds a local UDP port, sends `PORT <port>`
-4. Server UDP sends all chunks to client
-5. Client reassembles and writes `downloads/<name>`
-6. Server sends `DOWNLOAD_COMPLETE`
-
-Usage:
-```bash
-python client.py download 127.0.0.1 file.bin
-```
-
-## 🧠 Protocol (actual in code)
-
-- `CONTROL_PORT=9000`
-- `CHUNK_SIZE=4096`
-- UDP payload: 12-byte header + data:
-  - `(seq, total, len)` as `!III`
-- TLS control message ends with `\n` (send_msg/recv_msg)
-
-## 🧪 Demo: concurrent clients
-
-```bash
-python test_multi_client.py
-```
-- Creates:
-  - `small_1KB.bin`
-  - `medium_64KB.bin`
-  - `large_256KB.bin`
-- Launches 3 threads:
-  - each calls `upload("127.0.0.1", file)`
-- Reports success/failure + timing
-
-## ⚠️ Behavior notes
-
-- No explicit retransmission timer in code (infinite retry in loop until ACKs arrive)
-- No packet loss simulation; UDP reliability is assumed on local host
-- No SHA-256 hash or CRC validation currently in `client.upload` / `server.handle_upload` in actual implementation (the code has helpers in protocol.py, but they are unused)
-- No per-chunk `NACK` in current flow, only `ACK`; pending set loop triggers resend
+To observe the resumable file transfer mechanism:
+1. Start transferring a large file (e.g., a video or a large zip file).
+2. Press `Ctrl+C` on the sender's terminal abruptly, killing the transfer mid-way.
+3. Restart the sender node and run the exact same `send <filename>` command. 
+4. The system will log `Resuming from seq: <number>` and instantly pick up the transfer block without re-uploading the entire file.
