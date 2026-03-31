@@ -1,38 +1,48 @@
 # Architecture & Protocol Design
 
-This document explains the underlying mechanics of the Reliable P2P File Transfer Protocol. Since raw UDP does not guarantee delivery, ordering, or data integrity, this custom protocol was designed to build TCP-like reliability directly at the application layer.
+This document maps out the underlying mechanics of the Reliable P2P File Transfer Protocol. Because raw UDP intrinsically does not guarantee delivery, ordering, or data integrity, this custom protocol was hand-designed to build TCP-like reliability and military-grade encryption directly at the application layer.
 
 ## 1. Custom Packet Structure
 
-Every chunk of data sent over the network is encapsulated in a custom binary packet header generated via Python's `struct` module. 
+Every chunk of data routed over the network is encapsulated within a custom binary header crafted utilizing Python's `struct` module. 
 
 | Field | Size | Description |
 | :--- | :---: | :--- |
-| **Sequence Number** | 4 bytes | Identifies the exact chunk offset in the file to guarantee structural order. |
-| **Acknowledgment Number** | 4 bytes | Used by the receiver to inform the sender which specific chunk was successfully received. |
-| **Flags** | 1 byte | Bitmask indicating the packet control type (`SYN` = Handshake, `ACK` = Acknowledgment, `FIN` = End of Transfer, `DATA` = File Fragment). |
+| **Sequence Number** | 4 bytes | Identifies the exact chunk offset mathematically to guarantee ordering. |
+| **Acknowledgment Number** | 4 bytes | Used by the receiver to declare which specific chunk was successfully locked in. |
+| **Flags** | 1 byte | Bitmask indicating packet intent (`SYN` = Handshake, `ACK` = Acknowledgment, `FIN` = End of Transfer, `DATA` = File Fragment). |
 | **Checksum** | 4 bytes | A CRC32 hash computed exclusively on the payload to detect network corruption. |
-| **Payload** | <= 1400 bytes| Raw file data. Kept below 1400 bytes to easily fit inside standard 1500 byte Ethernet MTUs. |
+| **Encrypted Payload**| <= 1400 bytes| Raw file data dynamically encrypted via AES-256-CTR. |
 
 ## 2. Reliability & Throughput: Selective Repeat ARQ
 
-To ensure no packets are permanently lost while simultaneously maximizing network throughput speed, the sender uses **Selective Repeat Automatic Repeat Request (ARQ)**.
+To ensure no physical packets are permanently lost while dynamically maximizing network throughput, the transmitter deploys **Selective Repeat Automatic Repeat Request (ARQ)**.
 
-1. **Sliding Window:** The sender does not patiently wait for an acknowledgment (ACK) after every single packet. Instead, it concurrently broadcasts up to 64 consecutive packets at once (its "Window Size").
-2. **Selective ACKs:** When the receiver secures a packet, it immediately fires back a specific ACK for that exact sequence number. 
-3. **Timeouts & Retransmission:** The sender maintains a timestamp for all unacknowledged packets. If a packet's ACK is not received within `0.5 seconds`, the sender deduces it was dropped by the router and *selectively retransmits only that specific missing packet*, rather than dropping back and resending the entire window.
+1. **Sliding Window:** The sender does not wait for a single acknowledgment after every packet. Instead, it blasts up to 64 consecutive packets onto the network layer concurrently.
+2. **Selective ACKs:** The moment the receiver parses a valid packet, it instantly routes an ACK citing that specific sequence number exclusively back to the sender.
+3. **Targeted Retransmission:** The transmitter tracks a stopwatch for all unacknowledged packets in the window. If a packet expires, the sender deduces network loss and *selectively retransmits exclusively the missing block*, rather than naively flushing the entire buffer.
 
-## 3. The Synchronization Handshake (Resumability)
+## 3. Dynamic Congestion Control (Jacobson / Karn Algorithms)
 
-Before raw file transmission begins, a critical synchronization handshake dictates the state.
+A critical failure point of naive UDP ARQ engines is using a static timeout (e.g., `0.5s`). If the network spikes to a `0.6s` ping, a static system will redundantly rebroadcast the entire file, catastrophically flooding the router.
 
-1. The sender initiates transfer by transmitting a `SYN` packet containing a JSON payload with the `filename` and total `file size`.
-2. The receiver inspects its local `downloads/` directory. If a file with the identical name exists but its size is strictly smaller than the target size, the receiver mathematically calculates how many complete 1400-byte chunks it cleanly possesses.
-3. The receiver actively truncates any incomplete, dangling byte fragments at the end of the file and responds to the sender with an `ACK` containing the exact sequence chunk number it must resume from.
-4. The sender dynamically fast-forwards its local file pointer (`file.seek()`) to this byte offset and immediately begins transmitting the missing data.
+This project natively implements **Jacobson's Algorithm**:
+1. Every time a strictly fresh, non-retransmitted packet is cleanly ACKed (respecting **Karn’s Algorithm** to avoid ambiguous timing samples), the sender seamlessly tracks the precise Round Trip Time (`Sample_RTT`).
+2. The sender mathematically updates an Exponentially Weighted Moving Average (EWMA) to smoothly filter the `Estimated_RTT` alongside the network variance/deviation (`Dev_RTT`).
+3. The timeout timer dynamically adjusts in real-time exactly to `Estimated_RTT + (4 * Dev_RTT)`.
+4. **Exponential Backoff:** If a severe congestion event forces a retransmission, the dynamic timeout is explicitly doubled (`x2.0`) to mathematically grant the network hardware breathing room to recover.
 
-## 4. Multiclient Inbound Multiplexing
+## 4. End-to-End Cryptography (ECDH Key Exchange)
 
-The receiver logic operates as a true headless daemon. Early iterations of network projects often utilize global variables to track "the current transfer." 
+The protocol utilizes an industry-standard Diffie-Hellman implementation via the Python `cryptography` library for seamless, passwordless security wrapper operations.
 
-In contrast, this project maintains a hash map of connections utilizing the Sender's unique `(IP address, Port)` tuple as the routing key. This completely isolates the sequence tracking, out-of-order buffers, and I/O file objects for all incoming packets. This architecture guarantees the receiver node can independently and securely construct dozens of files from completely different peers simultaneously over the single bound UDP socket.
+1. **Exchange:** During the initial `SYN` handshake step, the Sender spawns a mathematical Elliptic Curve Diffie-Hellman (`ECDH SECP384R1`) keypair, broadcasting its Public Key. The receiver calculates and responds with its own newly minted Public Key. Both machines instantaneously derive an identically shared AES Secret via `HKDF`.
+2. **AES-256-CTR:** AES Counter-Mode is utilized to individually encrypt every single file block payload *pre-transmission*. Counter mode is selected because it strictly preserves byte-size with absolutely zero padding overhead—which maintains perfectly predictable UDP network chunk alignments.
+
+## 5. The Synchronization Handshake (Resumability)
+
+Before raw file transfer commences, the `SYN` handshake checks the disk status.
+
+1. The receiver inspects its local `downloads/` directory. If a file with an identical name exists but its size is strictly smaller than the target, the receiver mathematically deduces how many full 1400-byte UDP chunks it cleanly possesses.
+2. The receiver aggressively truncates dangling byte fragments at the end of the file and instructs the sender (via `SYN+ACK`) exactly which sequence chunk to resume transmitting from.
+3. Because AES-CTR operates procedurally per block, there is zero cryptographic state conflict on dropped files; the sender dynamically fast-forwards its file pointer, logically resumes encryption generation on the requested target byte, and resumes seamlessly.

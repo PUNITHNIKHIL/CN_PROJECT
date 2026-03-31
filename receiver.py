@@ -3,6 +3,7 @@ import os
 import json
 import logging
 from protocol import create_packet, parse_packet, FLAG_SYN, FLAG_ACK, FLAG_FIN, FLAG_DATA, MAX_PAYLOAD_SIZE
+from crypto import generate_ecdh_keypair, derive_aes_key, decrypt_chunk
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - Receiver - %(message)s')
 
@@ -39,7 +40,7 @@ def start_receiver(host='0.0.0.0', port=5000, download_dir='downloads'):
             logging.info(f"Received from {addr} | Seq: {seq_num} | Ack: {ack_num} | Flags: {flags_to_str(flags)} | Length: {len(payload)} bytes")
             
             if addr not in clients:
-                clients[addr] = {'expected_seq': 0, 'file_f': None, 'file_path': None, 'buffer': {}}
+                clients[addr] = {'expected_seq': 0, 'file_f': None, 'file_path': None, 'buffer': {}, 'aes_key': None}
                 
             client = clients[addr]
             
@@ -48,7 +49,16 @@ def start_receiver(host='0.0.0.0', port=5000, download_dir='downloads'):
                     metadata = json.loads(payload.decode('utf-8'))
                     filename = metadata['filename']
                     file_size = metadata['size']
-                except json.JSONDecodeError:
+                    peer_pub_b64 = metadata.get('pub_key')
+                except Exception:
+                    continue
+                    
+                # Generate our key and derive AES
+                try:
+                    private_key, public_b64 = generate_ecdh_keypair()
+                    client['aes_key'] = derive_aes_key(private_key, peer_pub_b64)
+                except Exception as e:
+                    logging.error(f"Failed to establish AES security: {e}")
                     continue
                     
                 client['file_path'] = os.path.join(download_dir, filename)
@@ -76,17 +86,21 @@ def start_receiver(host='0.0.0.0', port=5000, download_dir='downloads'):
                 
                 logging.info(f"Handshake complete for {filename} from {addr}. Resuming at seq {client['expected_seq']}")
                 
-                # Respond with SYN+ACK, ack_num is the expected_seq
-                ack_packet = create_packet(0, client['expected_seq'], FLAG_SYN | FLAG_ACK)
+                # Respond with SYN+ACK including our public key
+                resp_meta = {'pub_key': public_b64}
+                ack_payload = json.dumps(resp_meta).encode('utf-8')
+                ack_packet = create_packet(0, client['expected_seq'], FLAG_SYN | FLAG_ACK, ack_payload)
                 sock.sendto(ack_packet, addr)
                 continue
                 
             if flags & FLAG_DATA:
-                if not client['file_f']:
+                if not client['file_f'] or not client['aes_key']:
                     continue
                     
+                dec_payload = decrypt_chunk(client['aes_key'], seq_num, payload)
+                
                 if seq_num == client['expected_seq']:
-                    client['file_f'].write(payload)
+                    client['file_f'].write(dec_payload)
                     client['file_f'].flush()
                     client['expected_seq'] += 1
                     
@@ -98,7 +112,7 @@ def start_receiver(host='0.0.0.0', port=5000, download_dir='downloads'):
                 elif seq_num > client['expected_seq']:
                     # Only buffer if it's within a reasonable window
                     if seq_num - client['expected_seq'] < 1000:
-                        client['buffer'][seq_num] = payload
+                        client['buffer'][seq_num] = dec_payload
                     
                 # Selective ACK for the received sequence number
                 ack_packet = create_packet(0, seq_num, FLAG_ACK)

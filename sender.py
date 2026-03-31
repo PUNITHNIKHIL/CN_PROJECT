@@ -3,9 +3,23 @@ import os
 import json
 import logging
 import time
-from protocol import create_packet, parse_packet, FLAG_SYN, FLAG_ACK, FLAG_FIN, FLAG_DATA, MAX_PAYLOAD_SIZE
+from protocol import create_packet, parse_packet, FLAG_SYN, FLAG_ACK, FLAG_FIN, FLAG_DATA, MAX_PAYLOAD_SIZE, HEADER_SIZE
+from crypto import generate_ecdh_keypair, derive_aes_key, encrypt_chunk
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - Sender - %(message)s')
+
+def print_transfer_stats(stats, start_time):
+    elapsed = max(time.time() - start_time, 0.001)
+    speed = (stats['bytes_acked'] / elapsed / 1024)
+    print("\n" + "="*40)
+    print("         TRANSFER STATISTICS         ")
+    print("="*40)
+    print(f" Elapsed Time:    {elapsed:.2f} seconds")
+    print(f" Chunks Sent:     {stats['chunks_sent']}")
+    print(f" Chunks Acked:    {stats['chunks_acked']}")
+    print(f" Retransmissions: {stats['retransmissions']}")
+    print(f" Avg Speed:       {speed:.2f} KB/s")
+    print("="*40 + "\n")
 
 def send_file(filename, server_host='127.0.0.1', server_port=5000, window_size=64, timeout=0.5):
     if not os.path.exists(filename):
@@ -20,7 +34,8 @@ def send_file(filename, server_host='127.0.0.1', server_port=5000, window_size=6
     server_addr = (server_host, server_port)
     
     # Send SYN
-    metadata = {'filename': base_name, 'size': file_size}
+    private_key, public_b64 = generate_ecdh_keypair()
+    metadata = {'filename': base_name, 'size': file_size, 'pub_key': public_b64}
     syn_payload = json.dumps(metadata).encode('utf-8')
     syn_packet = create_packet(0, 0, FLAG_SYN, syn_payload)
     
@@ -28,6 +43,7 @@ def send_file(filename, server_host='127.0.0.1', server_port=5000, window_size=6
     
     resume_seq = 0
     handshake_done = False
+    aes_key = None
     
     # Simple blocking handshake loop
     sock.settimeout(2.0)
@@ -41,6 +57,14 @@ def send_file(filename, server_host='127.0.0.1', server_port=5000, window_size=6
                 if (flags & FLAG_SYN) and (flags & FLAG_ACK):
                     resume_seq = ack
                     handshake_done = True
+                    try:
+                        resp_meta = json.loads(payload.decode('utf-8'))
+                        peer_pub_b64 = resp_meta.get('pub_key')
+                        aes_key = derive_aes_key(private_key, peer_pub_b64)
+                        logging.info("AES-256 Key negotiated successfully!")
+                    except Exception as e:
+                        logging.error(f"Failed to derive encryption key: {e}")
+                        return
         except socket.timeout:
             logging.warning("SYN timeout, retrying...")
             
@@ -57,6 +81,17 @@ def send_file(filename, server_host='127.0.0.1', server_port=5000, window_size=6
     window = {}
     sock.settimeout(0.01) # Small timeout for receiving ACKs quickly
     
+    stats = {
+        'chunks_sent': 0,
+        'chunks_acked': 0,
+        'retransmissions': 0,
+        'bytes_acked': 0
+    }
+    
+    estimated_rtt = None
+    dev_rtt = 0
+    dynamic_timeout = timeout
+    
     start_time = time.time()
     
     try:
@@ -68,9 +103,17 @@ def send_file(filename, server_host='127.0.0.1', server_port=5000, window_size=6
                     if not chunk:
                         break # Unexpected EOF
                         
-                    packet = create_packet(next_seq, 0, FLAG_DATA, chunk)
-                    window[next_seq] = {'packet': packet, 'time': time.time(), 'acked': False}
+                    enc_chunk = encrypt_chunk(aes_key, next_seq, chunk)
+                    packet = create_packet(next_seq, 0, FLAG_DATA, enc_chunk)
+                    window[next_seq] = {
+                        'packet': packet, 
+                        'time': time.time(), 
+                        'acked': False,
+                        'retransmissions': 0
+                    }
                     sock.sendto(packet, server_addr)
+                    stats['chunks_sent'] += 1
+                    logging.info(f"Chunk {next_seq} sent.")
                 next_seq += 1
                 
             # Process incoming ACKs
@@ -83,8 +126,26 @@ def send_file(filename, server_host='127.0.0.1', server_port=5000, window_size=6
                         seq, ack, flags, payload = parsed
                         if flags & FLAG_ACK:
                             # Receiver sends seq_num in ACK packet
-                            if ack in window:
+                            if ack in window and not window[ack]['acked']:
                                 window[ack]['acked'] = True
+                                stats['chunks_acked'] += 1
+                                stats['bytes_acked'] += len(window[ack]['packet']) - HEADER_SIZE
+                                
+                                # Jacobson / Karels Algorithm (Dynamic RTT)
+                                # Karn's Algorithm dictates we ONLY sample RTT for packets that were never retransmitted
+                                if window[ack]['retransmissions'] == 0:
+                                    sample_rtt = time.time() - window[ack]['time']
+                                    if estimated_rtt is None:
+                                        estimated_rtt = sample_rtt
+                                        dev_rtt = sample_rtt / 2.0
+                                    else:
+                                        estimated_rtt = 0.875 * estimated_rtt + 0.125 * sample_rtt
+                                        dev_rtt = 0.75 * dev_rtt + 0.25 * abs(sample_rtt - estimated_rtt)
+                                        
+                                    dynamic_timeout = estimated_rtt + 4 * dev_rtt
+                                    dynamic_timeout = max(0.01, min(dynamic_timeout, 2.0)) # Hard bounds
+                                    
+                                logging.info(f"Chunk {ack} acked (Timeout is now: {dynamic_timeout:.3f}s)")
             except (socket.timeout, BlockingIOError):
                 pass
                 
@@ -97,21 +158,28 @@ def send_file(filename, server_host='127.0.0.1', server_port=5000, window_size=6
             current_time = time.time()
             for seq_num in range(base_seq, next_seq):
                 if seq_num in window and not window[seq_num]['acked']:
-                    if current_time - window[seq_num]['time'] > timeout:
-                        # logging.debug(f"Retransmitting seq {seq_num}")
+                    if current_time - window[seq_num]['time'] > dynamic_timeout:
+                        logging.warning(f"Timeout! Retransmitting Chunk {seq_num}...")
                         sock.sendto(window[seq_num]['packet'], server_addr)
                         window[seq_num]['time'] = current_time
+                        window[seq_num]['retransmissions'] += 1
+                        stats['retransmissions'] += 1
+                        
+                        # Exponential backoff on congestion
+                        dynamic_timeout = min(dynamic_timeout * 2.0, 2.0)
                         
     except KeyboardInterrupt:
         logging.info("Interrupted by user. Exiting.")
         file_f.close()
         sock.close()
+        print_transfer_stats(stats, start_time)
         return
         
     file_f.close()
     
     elapsed = time.time() - start_time
     logging.info(f"All chunks sent and acknowledged in {elapsed:.2f} seconds.")
+    print_transfer_stats(stats, start_time)
     
     # Send FIN
     fin_packet = create_packet(0, 0, FLAG_FIN)
